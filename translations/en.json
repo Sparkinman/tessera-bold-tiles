@@ -1,5 +1,7 @@
 {
-  "_meta": { "name": "English" },
+  "_meta": {
+    "name": "English"
+  },
   "screen": {
     "on": "On",
     "off": "Off",
@@ -20,7 +22,19 @@
     "act_on": "Turn on",
     "act_off": "Turn off",
     "working": "Working",
-    "name": "Bold tiles"
+    "name": "Bold tiles",
+    "loading": "Loading the last week",
+    "failed": "Could not get the history",
+    "no_history": "No history yet",
+    "week": "Week",
+    "today": "Today",
+    "s0": "Sun",
+    "s1": "Mon",
+    "s2": "Tue",
+    "s3": "Wed",
+    "s4": "Thu",
+    "s5": "Fri",
+    "s6": "Sat"
   },
   "app": {
     "name": "Bold tiles",
@@ -57,6 +71,11 @@
     "color_yellow": "Yellow",
     "color_blue": "Blue",
     "color_green": "Green",
-    "color_none": "None"
+    "color_none": "None",
+    "tap_value_hint": "Graph and forecast opens a large card with the last week of this sensor as a graph and the forecast of the weather entity below.",
+    "tap_card": "Graph and forecast",
+    "forecast": "Forecast",
+    "forecast_hint": "The weather entity whose daily forecast the card shows (for example the forecast of this sensor's place).",
+    "card_history": "Bold history"
   }
 }
