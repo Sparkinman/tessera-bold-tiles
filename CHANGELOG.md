@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.0
+
+- Bold value: Tap: Graph and forecast opens a large card with the reading now, the last seven days as a bar graph
+  (the recorder's hourly means) with the week's low and high, and the daily forecast of a weather entity you choose.
+
 ## 0.3.0
 
 - Bold state: a Tap option that opens a large popup with the state and one big key to lock or unlock (or open or

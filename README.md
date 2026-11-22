@@ -6,7 +6,8 @@ screen's own typeface) in five sizes, 32 to 108 px, and each tile takes the larg
 flash, so it is meant for the larger boards.
 
 - **Bold value**: a sensor's number, large and bold, its unit smaller beside it (Orem 33.3 °F). Decimals automatic,
-  none, one or two.
+  none, one or two. With **Tap: Graph and forecast** a tap opens a large card: the reading, the last seven days as
+  a bar graph, and the daily forecast of a weather entity you pick on the tile.
 - **Bold state**: an entity's state as one large word: Open or Closed for doors, windows and gates, Locked or Unlocked,
   On or Off. Red while something stands open (can be turned off). With **Tap: Popup to lock / unlock** a tap opens a large popup with
   the state and one big key to lock or unlock (or open or close a cover, or turn a switch on or off).
