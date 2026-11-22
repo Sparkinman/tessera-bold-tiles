@@ -1,7 +1,7 @@
 # Bold tiles: an entity's value, state or switch in large bold Roboto, the name small above it, for a screen read from
 # across the room. The value takes the largest size that fits the tile, up to the size the tile is set to.
 id: bold_tiles
-version: 0.2.0
+version: 0.2.1
 api: "0.14"
 icon: thermometer
 maintainer: Paul McNeil
