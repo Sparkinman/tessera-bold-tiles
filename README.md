@@ -8,7 +8,8 @@ flash, so it is meant for the larger boards.
 - **Bold value**: a sensor's number, large and bold, its unit smaller beside it (Orem 33.3 °F). Decimals automatic,
   none, one or two.
 - **Bold state**: an entity's state as one large word: Open or Closed for doors, windows and gates, Locked or Unlocked,
-  On or Off. Red while something stands open (can be turned off).
+  On or Off. Red while something stands open (can be turned off). With **Tap: Popup to lock / unlock** a tap opens a large popup with
+  the state and one big key to lock or unlock (or open or close a cover, or turn a switch on or off).
 - **Bold switch**: a light or switch with its name large and bold, over two lines if need be, On or Off under it. A tap
   turns it on or off; a soft colour shows behind it while it is on.
 

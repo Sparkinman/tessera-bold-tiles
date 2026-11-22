@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.0
+
+- Bold state: a Tap option that opens a large popup with the state and one big key to lock or unlock (or open or
+  close a cover, or turn a switch on or off). Unlocking only ever happens from that key.
+
 ## 0.2.1
 
 - Changelog headings in the format Tessera's check reads; the README notes the larger screens it is made for.
