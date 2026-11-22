@@ -1,5 +1,6 @@
 #include "bold_tiles.h"
 #include <algorithm>
+#include <functional>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -201,30 +202,226 @@ class ValueTile : public BoldTile {
   lv_obj_t *value_{}, *unit_{};
 };
 
-// An entity's state as a large bold word, in the alert colour when it stands open or unlocked.
+// What a Bold state tile can do to its entity, and the words for it: a lock locks or unlocks, a cover opens or closes,
+// a switch, light or input boolean turns on or off. NONE for an entity it cannot change, or a state in between.
+enum class Act : uint8_t { NONE, LOCK, UNLOCK, OPEN, CLOSE, ON, OFF };
+
+static Act act_for(const std::string &domain, const std::string &state) {
+  if (domain == "lock") {
+    if (state == "locked") return Act::UNLOCK;
+    if (state == "unlocked" || state == "open" || state == "jammed") return Act::LOCK;
+  } else if (domain == "cover") {
+    if (state == "closed") return Act::OPEN;
+    if (state == "open") return Act::CLOSE;
+  } else if (domain == "switch" || domain == "light" || domain == "input_boolean") {
+    if (state == "on") return Act::OFF;
+    if (state == "off") return Act::ON;
+  }
+  return Act::NONE;
+}
+
+// The popup a Bold state tile opens on a tap: the name, the state in the largest bold letters that fit, and one big key
+// under it that does the opposite (Unlock while it is locked, Lock while it is not). As wide and as tall as the screen
+// lets a popup be. A tap on the key sends the action; the key then says what is happening ("Locking") until Home
+// Assistant reports the new state, and the popup closes itself a moment after.
+class ActionPopup : public tessera::Popup {
+ public:
+  ActionPopup(const BoldTiles *plugin, std::vector<const lv_font_t *> fonts, std::string entity, std::string name,
+              std::function<void()> gone)
+      : plugin_(plugin), fonts_(std::move(fonts)), entity_(std::move(entity)), name_text_(std::move(name)),
+        gone_(std::move(gone)) {}
+
+  void open(const tessera::PopupContext &c) override {
+    w_ = c.width;
+    h_ = c.height;
+    const int gap = ui::px(ui::large() ? 14 : 10);
+    // The name on the first row, short of the close key.
+    name_ = ui::label(c.parent, Font::HEADLINE, theme::INK_SOFT);
+    const int name_h = ui::line_height(Font::HEADLINE);
+    lv_obj_set_size(name_, std::max(1, w_ - c.corner), name_h);
+    lv_obj_set_pos(name_, 0, std::max(0, (c.key - name_h) / 2));
+    ui::set_text(name_, name_text_);
+    top_ = std::max(c.key, name_h) + gap;
+    // The key: the lower 40% of the room, a rounded block with its word in the middle.
+    key_h_ = h_ * 40 / 100;
+    key_y_ = h_ - key_h_;
+    key_ = ui::block(c.parent, theme::ACCENT);
+    lv_obj_set_size(key_, w_, key_h_);
+    lv_obj_set_pos(key_, 0, key_y_);
+    lv_obj_set_style_radius(key_, ui::px(18), 0);
+    key_word_ = ui::label(key_, Font::TITLE, theme::ON_ACCENT);
+    word_ = ui::label(c.parent, Font::TITLE, theme::INK);
+    word_h_ = key_y_ - gap - top_;
+    opened_ = true;
+    paint();
+  }
+
+  // The tile's latest state: what it shows and what the key does now.
+  void set_state(const std::string &state, const std::string &word, bool alert, Act act) {
+    const bool changed = !state_.empty() && state != state_;
+    state_ = state;
+    word_text_ = word;
+    alert_ = alert;
+    act_ = act;
+    if (busy_ && changed) {
+      busy_ = false;
+      close_at_ = now_ + 2;  // done: let it be seen, then go
+    }
+    if (opened_) paint();
+  }
+
+  void on_tick(uint32_t epoch) override {
+    now_ = epoch;
+    if (close_at_ && epoch >= close_at_) {
+      close_at_ = 0;
+      if (gone_) gone_();
+      tessera::close_popup(plugin_);
+    }
+  }
+
+  void on_tap() override {
+    if (busy_ || act_ == Act::NONE) return;
+    const tessera::Point p = tessera::tap_point();
+    // The key, whether the point comes in the room's pixels or the glass's.
+    lv_area_t a;
+    lv_obj_get_coords(key_, &a);
+    const bool in_room = p.y >= key_y_ && p.y <= key_y_ + key_h_;
+    const bool on_glass = p.x >= a.x1 && p.x <= a.x2 && p.y >= a.y1 && p.y <= a.y2;
+    if (!in_room && !on_glass) return;
+    switch (act_) {
+      case Act::LOCK: tessera::action("lock.lock", entity_); break;
+      case Act::UNLOCK: tessera::action("lock.unlock", entity_); break;
+      case Act::OPEN: tessera::action("cover.open_cover", entity_); break;
+      case Act::CLOSE: tessera::action("cover.close_cover", entity_); break;
+      case Act::ON: tessera::wish(entity_, tessera::Wish::ON_OFF, "on"); break;
+      case Act::OFF: tessera::wish(entity_, tessera::Wish::ON_OFF, "off"); break;
+      default: return;
+    }
+    busy_ = true;
+    close_at_ = now_ ? now_ + 20 : 0;  // no answer in 20 s: it goes anyway
+    paint();
+  }
+
+  void on_theme() override { paint(); }
+
+  void on_dismiss() override {
+    if (gone_) gone_();
+  }
+
+ private:
+  const char *key_text() const {
+    if (busy_) {
+      switch (act_) {
+        case Act::LOCK: return "locking";
+        case Act::UNLOCK: return "unlocking";
+        case Act::OPEN: return "opening";
+        case Act::CLOSE: return "closing";
+        default: return "working";
+      }
+    }
+    switch (act_) {
+      case Act::LOCK: return "act_lock";
+      case Act::UNLOCK: return "act_unlock";
+      case Act::OPEN: return "act_open";
+      case Act::CLOSE: return "act_close";
+      case Act::ON: return "act_on";
+      case Act::OFF: return "act_off";
+      default: return "unavailable";
+    }
+  }
+
+  // The largest font whose capitals fit `max_h` and whose text fits `max_w`.
+  const lv_font_t *fit(const std::string &text, int max_w, int max_h) const {
+    for (const lv_font_t *f : fonts_)
+      if (cap_h(f) <= max_h && text_w(text, f) <= max_w) return f;
+    return fonts_.back();
+  }
+
+  // Draws one line of words centred in a band, by their capitals.
+  static void place(lv_obj_t *label, const std::string &text, const lv_font_t *f, int x0, int w, int y0, int h) {
+    lv_obj_set_style_text_font(label, f, 0);
+    ui::set_text(label, text);
+    int ctop, ch;
+    cap_box(f, ctop, ch);
+    const int tw = text_w(text, f);
+    lv_obj_set_size(label, tw + 2, f->line_height);
+    lv_obj_set_pos(label, x0 + std::max(0, (w - tw) / 2), y0 + std::max(0, (h - ch) / 2) - ctop);
+  }
+
+  void paint() {
+    if (!opened_) return;
+    place(word_, word_text_, fit(word_text_, w_, word_h_ * 80 / 100), 0, w_, top_, word_h_);
+    ui::set_tone(word_, alert_ ? tessera::Tone::ALERT : tessera::Tone::NORMAL, theme::INK);
+    const std::string kw = plugin_->text(key_text());
+    place(key_word_, kw, fit(kw, w_ * 85 / 100, key_h_ * 45 / 100), 0, w_, 0, key_h_);
+    // Unlocking and opening in the alert colour, the rest in the accent; a key with nothing to do goes grey.
+    const bool opens = act_ == Act::UNLOCK || act_ == Act::OPEN;
+    ui::set_fill(key_, act_ == Act::NONE ? tessera::Tone::NORMAL : opens ? tessera::Tone::ALERT : tessera::Tone::ACCENT,
+                 theme::ACCENT);
+    lv_obj_set_style_bg_opa(key_, busy_ ? LV_OPA_60 : LV_OPA_COVER, 0);
+    ui::set_color(key_word_, theme::ON_ACCENT);
+  }
+
+  const BoldTiles *plugin_;
+  std::vector<const lv_font_t *> fonts_;
+  std::string entity_, name_text_, state_, word_text_;
+  std::function<void()> gone_;
+  bool opened_ = false, alert_ = false, busy_ = false;
+  Act act_ = Act::NONE;
+  int w_ = 0, h_ = 0, top_ = 0, word_h_ = 0, key_y_ = 0, key_h_ = 0;
+  uint32_t now_ = 0, close_at_ = 0;
+  lv_obj_t *name_{}, *word_{}, *key_{}, *key_word_{};
+};
+
+// An entity's state as a large bold word, in the alert colour when it stands open or unlocked. With Tap: Popup, a tap
+// opens the ActionPopup above to lock or unlock it (or open or close, or turn on or off).
 class StateTile : public BoldTile {
  public:
   using BoldTile::BoldTile;
 
+  ~StateTile() override {
+    // A popup of this tile outlives it only on the glass: close it, so it never calls back into a deleted tile.
+    if (popup_) tessera::close_popup(plugin_);
+  }
+
   void create(const tessera::TileContext &c) override {
     begin(c, true);
     alert_on_ = c.options["alert"] | true;
+    const std::string tap = c.options["tap"] | "none";
+    tap_popup_ = tap == "popup";
     word_ = ui::label(c.parent, Font::TITLE, theme::INK);
+  }
+
+  void on_tap() override {
+    if (!tap_popup_ || entity_.empty()) return;
+    const std::string domain = entity_.substr(0, entity_.find('.'));
+    tessera::show_popup(
+        plugin_,
+        [this, domain]() {
+          popup_ = new ActionPopup(plugin_, fonts_, entity_, shown_name_, [this]() { popup_ = nullptr; });
+          popup_->set_state(state_, state_word_, alert_, act_for(domain, state_));
+          return popup_;
+        },
+        tessera::PopupWidth::WIDE);
   }
 
   void on_state(JsonObjectConst data) override {
     show_name(data);
+    shown_name_ = name_of(data);
     const std::string state = data["state"] | "";
     const std::string dc = data["attributes"]["device_class"] | "";
     const std::string domain = entity_.substr(0, entity_.find('.'));
     bool alert = false;
     const std::string word = word_for(domain, dc, state, alert);
     alert_ = alert_on_ && alert;
+    state_ = state;
+    state_word_ = word;
     if (word != text_) {
       text_ = word;
       layout();
     }
     paint();
+    if (popup_) popup_->set_state(state_, state_word_, alert_, act_for(domain, state_));
   }
 
   void on_theme() override {
@@ -279,8 +476,9 @@ class StateTile : public BoldTile {
     if (word_) ui::set_tone(word_, alert_ ? tessera::Tone::ALERT : tessera::Tone::NORMAL, theme::INK);
   }
 
-  bool alert_on_ = true, alert_ = false;
-  std::string text_;
+  bool alert_on_ = true, alert_ = false, tap_popup_ = false;
+  std::string text_, state_, state_word_, shown_name_;
+  ActionPopup *popup_{};
   lv_obj_t *word_{};
 };
 
