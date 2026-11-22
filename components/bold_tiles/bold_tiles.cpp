@@ -3,6 +3,7 @@
 #include <functional>
 #include <cctype>
 #include <cmath>
+#include <map>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -122,18 +123,30 @@ class ValueTile : public BoldTile {
     const std::string decimals = c.options["decimals"] | "auto";
     decimals_ = decimals == "auto" ? -1 : atoi(decimals.c_str());
     unit_on_ = c.options["unit"] | true;
+    const std::string tap = c.options["tap"] | "none";
+    tap_card_ = tap == "card";
+    forecast_ = c.options["forecast"] | "";
+    tile_ = c.tile;
     value_ = ui::label(c.parent, Font::TITLE, theme::INK);
     unit_ = ui::label(c.parent, Font::TITLE, theme::INK_SOFT);
   }
 
   void on_state(JsonObjectConst data) override {
     show_name(data);
+    seen_name_ = name_of(data);
     const std::string text = format(data["state"] | "");
     const std::string unit = unit_on_ ? std::string(data["attributes"]["unit_of_measurement"] | "") : "";
+    // What the history card shows of this tile: its weather entity, unit and reading.
+    plugin_->set_link(entity_, BoldTiles::Link{forecast_, std::string(data["attributes"]["unit_of_measurement"] | ""), text});
     if (text == text_ && unit == unit_text_) return;
     text_ = text;
     unit_text_ = unit;
     layout();
+  }
+
+  // With Tap: Graph and forecast, a tap opens the history card for this sensor.
+  void on_tap() override {
+    if (tap_card_ && !entity_.empty()) tessera::open_card(plugin_->plugin_id(), "history", entity_, tile_, seen_name_);
   }
 
   void on_theme() override {
@@ -196,9 +209,9 @@ class ValueTile : public BoldTile {
     lv_obj_set_pos(unit_, x + vw + gap_ / 2, y + ctop - utop);
   }
 
-  int decimals_ = -1;
-  bool unit_on_ = true;
-  std::string text_, unit_text_;
+  int decimals_ = -1, tile_ = -1;
+  bool unit_on_ = true, tap_card_ = false;
+  std::string text_, unit_text_, forecast_, seen_name_;
   lv_obj_t *value_{}, *unit_{};
 };
 
@@ -553,10 +566,340 @@ class SwitchTile : public BoldTile {
   lv_obj_t *glow_{}, *title_{}, *state_{};
 };
 
+// ---- The history card: the last week as bars and the forecast for the place ----
+
+static int32_t civil_days(int y, int m, int d) {
+  y -= m <= 2;
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const int yoe = y - era * 400;
+  const int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  return era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+}
+// A moment as ISO 8601 in UTC ("2026-11-15T05:00:00Z"), for the recorder's start_time.
+static std::string iso_utc(uint32_t epoch) {
+  int32_t z = static_cast<int32_t>(epoch / 86400) + 719468;
+  const int32_t era = (z >= 0 ? z : z - 146096) / 146097;
+  const uint32_t doe = static_cast<uint32_t>(z - era * 146097);
+  const uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int32_t y = static_cast<int32_t>(yoe) + era * 400;
+  const uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  const uint32_t mp = (5 * doy + 2) / 153;
+  const uint32_t d = doy - (153 * mp + 2) / 5 + 1;
+  const uint32_t m = mp < 10 ? mp + 3 : mp - 9;
+  y += m <= 2;
+  const uint32_t s = epoch % 86400;
+  char buf[24];
+  snprintf(buf, sizeof buf, "%04d-%02u-%02uT%02u:%02u:00Z", static_cast<int>(y), m, d, s / 3600, (s / 60) % 60);
+  return buf;
+}
+static uint32_t weather_icon(const std::string &c) {
+  if (c == "sunny") return 0xF0599;
+  if (c == "clear-night") return 0xF0594;
+  if (c == "cloudy") return 0xF0590;
+  if (c == "partlycloudy") return 0xF0595;
+  if (c == "rainy") return 0xF0597;
+  if (c == "pouring") return 0xF0596;
+  if (c == "snowy") return 0xF0598;
+  if (c == "snowy-rainy") return 0xF067F;
+  if (c == "fog") return 0xF0591;
+  if (c == "hail") return 0xF0592;
+  if (c == "lightning") return 0xF0593;
+  if (c == "lightning-rainy") return 0xF067E;
+  if (c == "windy" || c == "windy-variant") return 0xF059D;
+  return 0xF05D6;
+}
+static std::string whole(float v, const char *suffix = "\xC2\xB0") {
+  if (std::isnan(v)) return "-";
+  char buf[16];
+  snprintf(buf, sizeof buf, "%d%s", static_cast<int>(std::lround(v)), suffix);
+  return buf;
+}
+// One line of words centred in a band by their capitals, from x0 (or ending at x0 with `right`, or centred in band_w).
+static void put(lv_obj_t *label, const std::string &text, const lv_font_t *f, int x0, int y0, int h, int align = 0,
+                int band_w = 0) {
+  lv_obj_set_style_text_font(label, f, 0);
+  ui::set_text(label, text);
+  int ctop, ch;
+  cap_box(f, ctop, ch);
+  const int tw = text_w(text, f);
+  lv_obj_set_size(label, tw + 2, f->line_height);
+  const int x = align < 0 ? x0 - tw : align > 0 ? x0 + std::max(0, (band_w - tw) / 2) : x0;
+  lv_obj_set_pos(label, x, y0 + std::max(0, (h - ch) / 2) - ctop);
+  lv_obj_remove_flag(label, LV_OBJ_FLAG_HIDDEN);
+}
+static void gone(lv_obj_t *o) {
+  if (o) lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+}
+
+// The card a Bold value tile opens with Tap: Graph and forecast. At the top the reading now, large, and the week's low
+// and high; under it the last seven days as bars (one per three hours, from the recorder's hourly means) with the
+// days marked; at the bottom the daily forecast of the weather entity chosen on the tile, a bold column per day.
+class HistoryCard : public tessera::Card, public BoldTiles::Answerer {
+ public:
+  explicit HistoryCard(const BoldTiles *plugin) : plugin_(plugin) {}
+  ~HistoryCard() override {
+    if (plugin_->answerer() == this) plugin_->set_answerer(nullptr);
+  }
+
+  void open(const tessera::CardContext &c) override {
+    w_ = c.width;
+    h_ = c.height;
+    entity_ = c.entity ? c.entity : "";
+    const BoldTiles::Link link = plugin_->link(entity_);
+    weather_ = link.weather;
+    unit_ = link.unit;
+    now_text_ = link.value;
+    for (auto it = plugin_->fonts().rbegin(); it != plugin_->fonts().rend(); ++it) fonts_.push_back((*it)->get_lv_font());
+    fonts_.push_back(ui::font(Font::TITLE));
+    pad_ = ui::px(14);
+    now_ = ui::label(c.parent, Font::TITLE, theme::INK);
+    range_ = ui::label(c.parent, Font::TITLE, theme::INK_SOFT);
+    hi_ = ui::label(c.parent, Font::BODY, theme::MUTED);
+    lo_ = ui::label(c.parent, Font::BODY, theme::MUTED);
+    for (auto &b : bars_) {
+      b = ui::block(c.parent, theme::ACCENT);
+      lv_obj_set_style_radius(b, ui::px(2), 0);
+      gone(b);
+    }
+    for (auto &m : marks_) {
+      m = ui::label(c.parent, Font::BODY, theme::MUTED);
+      gone(m);
+    }
+    for (auto &col : cols_) {
+      col.day = ui::label(c.parent, Font::TITLE, theme::INK_SOFT);
+      col.icon = ui::label(c.parent, Font::ICON, theme::INK);
+      col.hi = ui::label(c.parent, Font::TITLE, theme::INK);
+      col.lo = ui::label(c.parent, Font::TITLE, theme::MUTED);
+      gone(col.day), gone(col.icon), gone(col.hi), gone(col.lo);
+    }
+    note_ = ui::label(c.parent, Font::BODY, theme::MUTED);
+    // The bands: the reading 18%, the graph 47%, the forecast the rest.
+    top_h_ = h_ * 18 / 100;
+    graph_y_ = top_h_;
+    graph_h_ = h_ * 47 / 100;
+    fc_y_ = graph_y_ + graph_h_;
+    fc_h_ = h_ - fc_y_;
+    put(note_, plugin_->text("loading"), ui::font(Font::BODY), pad_, graph_y_, graph_h_);
+    plugin_->set_answerer(this);
+    if (!weather_.empty()) {
+      JsonDocument request;
+      request["ask"] = "call_service:weather.get_forecasts";
+      request["data"]["entity_id"] = weather_;
+      request["data"]["type"] = "daily";
+      forecast_re_ = tessera::send(const_cast<BoldTiles *>(plugin_), request.as<JsonObjectConst>());
+    }
+    paint_top();
+  }
+
+  void on_state(JsonObjectConst data) override {
+    const std::string state = data["state"] | "";
+    if (!state.empty() && state != "unavailable" && state != "unknown") {
+      char *end = nullptr;
+      const float v = strtof(state.c_str(), &end);
+      if (end != state.c_str()) {
+        char buf[16];
+        snprintf(buf, sizeof buf, "%.1f", v);
+        now_text_ = buf;
+        paint_top();
+      }
+    }
+  }
+
+  void on_tick(uint32_t epoch) override {
+    if (!epoch) return;
+    now_epoch_ = epoch;
+    if (!history_re_ && !history_asked_) {
+      // The last seven days of hourly means, from the recorder.
+      history_asked_ = true;
+      JsonDocument request;
+      request["ask"] = "recorder/statistics_during_period";
+      request["data"]["start_time"] = iso_utc(epoch - 7 * 86400);
+      request["data"]["statistic_ids"].add(entity_);
+      request["data"]["period"] = "hour";
+      request["data"]["types"].add("mean");
+      history_re_ = tessera::send(const_cast<BoldTiles *>(plugin_), request.as<JsonObjectConst>());
+      if (!history_re_) put(note_, plugin_->text("failed"), ui::font(Font::BODY), pad_, graph_y_, graph_h_);
+    }
+  }
+
+  void answer(JsonObjectConst message) override {
+    const uint32_t re = message["re"] | 0u;
+    if (!re) return;
+    if (re == history_re_) {
+      if (!(message["ok"] | false)) {
+        put(note_, plugin_->text("failed"), ui::font(Font::BODY), pad_, graph_y_, graph_h_);
+        return;
+      }
+      values_.clear();
+      // With the manifest's answers: {"mean": [..]}; without: {"<id>": [{"mean": ..}, ..]}.
+      JsonVariantConst mean = message["result"]["mean"];
+      if (mean.is<JsonArrayConst>()) {
+        for (JsonVariantConst v : mean.as<JsonArrayConst>()) values_.push_back(v | NAN);
+      } else {
+        for (JsonObjectConst p : message["result"][entity_].as<JsonArrayConst>()) values_.push_back(p["mean"] | NAN);
+      }
+      values_.erase(std::remove_if(values_.begin(), values_.end(), [](float v) { return std::isnan(v); }), values_.end());
+      paint_graph();
+      paint_top();
+    } else if (re == forecast_re_) {
+      days_.clear();
+      if (message["ok"] | false) {
+        for (JsonObjectConst f : message["result"][weather_]["forecast"].as<JsonArrayConst>()) {
+          Day d;
+          int y = 0, m = 0, day = 0;
+          if (sscanf(f["datetime"] | "", "%d-%d-%d", &y, &m, &day) != 3) continue;
+          d.civil = civil_days(y, m, day);
+          d.condition = f["condition"] | "";
+          d.high = f["temperature"] | NAN;
+          d.low = f["templow"] | NAN;
+          days_.push_back(d);
+          if (days_.size() >= 7) break;
+        }
+      }
+      paint_forecast();
+    }
+    tessera::refresh();
+  }
+
+  void on_theme() override {
+    for (auto &b : bars_) lv_obj_set_style_bg_color(b, ui::color(theme::ACCENT), 0);
+  }
+
+ private:
+  struct Day {
+    int32_t civil = 0;
+    std::string condition;
+    float high = NAN, low = NAN;
+  };
+  struct Col {
+    lv_obj_t *day{}, *icon{}, *hi{}, *lo{};
+  };
+  static constexpr int BARS = 56;
+
+  const lv_font_t *fit(const std::string &text, int max_w, int max_h) const {
+    for (const lv_font_t *f : fonts_)
+      if (cap_h(f) <= max_h && text_w(text, f) <= max_w) return f;
+    return fonts_.back();
+  }
+
+  void paint_top() {
+    const std::string now = now_text_.empty() ? "-" : now_text_ + unit_;
+    put(now_, now, fit(now, w_ * 50 / 100, top_h_ * 70 / 100), pad_, 0, top_h_);
+    if (!values_.empty()) {
+      const auto mm = std::minmax_element(values_.begin(), values_.end());
+      std::string r = plugin_->text("week") + std::string("  ") + whole(*mm.first) + " / " + whole(*mm.second);
+      put(range_, r, fit(r, w_ * 45 / 100, top_h_ * 40 / 100), w_ - pad_, 0, top_h_, -1);
+    }
+  }
+
+  void paint_graph() {
+    gone(note_);
+    for (auto &b : bars_) gone(b);
+    for (auto &m : marks_) gone(m);
+    if (values_.size() < 2) {
+      put(note_, plugin_->text("no_history"), ui::font(Font::BODY), pad_, graph_y_, graph_h_);
+      return;
+    }
+    // Three hours a bar, the newest at the right.
+    const int n = std::min<int>(BARS, (values_.size() + 2) / 3);
+    const int per = (values_.size() + n - 1) / n;
+    std::vector<float> bucket;
+    for (int i = 0; i < n; ++i) {
+      float sum = 0;
+      int count = 0;
+      for (int k = i * per; k < std::min<int>(values_.size(), (i + 1) * per); ++k) sum += values_[k], ++count;
+      if (count) bucket.push_back(sum / count);
+    }
+    const auto mm = std::minmax_element(values_.begin(), values_.end());
+    const float lo = *mm.first, hi = *mm.second, span = std::max(1.0f, hi - lo);
+    const int label_w = ui::px(60);
+    const int marks_h = ui::line_height(Font::BODY);
+    const int x0 = pad_ + label_w, gw = w_ - x0 - pad_;
+    const int gh = graph_h_ - marks_h - ui::px(8);
+    const int slot = std::max(2, gw / static_cast<int>(bucket.size()));
+    const int bar_w = std::max(1, slot * 70 / 100);
+    for (size_t i = 0; i < bucket.size(); ++i) {
+      const int bh = std::max(ui::px(3), static_cast<int>((bucket[i] - lo) / span * gh * 0.9f) + gh / 10);
+      lv_obj_set_size(bars_[i], bar_w, bh);
+      lv_obj_set_pos(bars_[i], x0 + static_cast<int>(i) * slot, graph_y_ + gh - bh);
+      lv_obj_remove_flag(bars_[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    // The week's high and low beside the bars.
+    put(hi_, whole(hi), ui::font(Font::BODY), pad_, graph_y_, marks_h);
+    put(lo_, whole(lo), ui::font(Font::BODY), pad_, graph_y_ + gh - marks_h, marks_h);
+    // The days under the bars, where a local day begins (the newest bar is the last hour).
+    if (!now_epoch_) return;
+    static const char *const SHORT[7] = {"s0", "s1", "s2", "s3", "s4", "s5", "s6"};
+    int marks = 0, last_day = -1;
+    for (size_t i = 0; i < bucket.size() && marks < 8; ++i) {
+      const uint32_t back = static_cast<uint32_t>((values_.size() - 1 - std::min<size_t>(values_.size() - 1, i * per)) * 3600u);
+      const tessera::LocalTime t = tessera::local_time(now_epoch_ - back);
+      if (t.day != last_day) {
+        if (last_day != -1) {
+          const int wd = static_cast<int>(((civil_days(t.year, t.month, t.day) % 7) + 11) % 7);
+          put(marks_[marks++], plugin_->text(SHORT[wd]), ui::font(Font::BODY), x0 + static_cast<int>(i) * slot,
+              graph_y_ + gh + ui::px(4), marks_h);
+        }
+        last_day = t.day;
+      }
+    }
+  }
+
+  void paint_forecast() {
+    for (auto &col : cols_) gone(col.day), gone(col.icon), gone(col.hi), gone(col.lo);
+    if (days_.empty()) return;
+    static const char *const SHORT[7] = {"s0", "s1", "s2", "s3", "s4", "s5", "s6"};
+    int32_t today = 0;
+    if (now_epoch_) {
+      const tessera::LocalTime t = tessera::local_time(now_epoch_);
+      today = civil_days(t.year, t.month, t.day);
+    }
+    std::vector<const Day *> shown;
+    for (const Day &d : days_)
+      if (!today || d.civil >= today) shown.push_back(&d);
+    const int n = std::min<int>(shown.size(), 7);
+    if (!n) return;
+    const int col_w = (w_ - 2 * pad_) / n;
+    const int day_h = fc_h_ * 22 / 100, icon_h = ui::line_height(Font::ICON), rest = fc_h_ - day_h - icon_h;
+    for (int i = 0; i < n; ++i) {
+      const Day &d = *shown[i];
+      Col &col = cols_[i];
+      const int x = pad_ + i * col_w;
+      const std::string name = d.civil == today ? plugin_->text("today") : plugin_->text(SHORT[((d.civil % 7) + 11) % 7]);
+      put(col.day, name, fit(name, col_w * 90 / 100, day_h * 60 / 100), x, fc_y_, day_h, 1, col_w);
+      ui::set_text(col.icon, ui::icon(weather_icon(d.condition)));
+      lv_obj_set_size(col.icon, col_w, icon_h);
+      lv_obj_set_style_text_align(col.icon, LV_TEXT_ALIGN_CENTER, 0);
+      lv_obj_set_pos(col.icon, x, fc_y_ + day_h);
+      lv_obj_remove_flag(col.icon, LV_OBJ_FLAG_HIDDEN);
+      const std::string hi = whole(d.high), lo = whole(d.low);
+      put(col.hi, hi, fit(hi, col_w * 85 / 100, rest * 40 / 100), x, fc_y_ + day_h + icon_h, rest * 58 / 100, 1, col_w);
+      put(col.lo, lo, fit(lo, col_w * 70 / 100, rest * 25 / 100), x, fc_y_ + day_h + icon_h + rest * 58 / 100,
+          rest * 42 / 100, 1, col_w);
+    }
+  }
+
+  const BoldTiles *plugin_;
+  int w_ = 0, h_ = 0, pad_ = 14, top_h_ = 0, graph_y_ = 0, graph_h_ = 0, fc_y_ = 0, fc_h_ = 0;
+  uint32_t now_epoch_ = 0, history_re_ = 0, forecast_re_ = 0;
+  bool history_asked_ = false;
+  std::string entity_, weather_, unit_, now_text_;
+  std::vector<const lv_font_t *> fonts_;
+  std::vector<float> values_;
+  std::vector<Day> days_;
+  lv_obj_t *now_{}, *range_{}, *hi_{}, *lo_{}, *bars_[BARS]{}, *marks_[8]{}, *note_{};
+  Col cols_[7];
+};
+
+void BoldTiles::on_message(JsonObjectConst message) {
+  if (answerer_) answerer_->answer(message);
+}
+
 void BoldTiles::setup() {
   add_tile("value", [this]() { return new ValueTile(this); });
   add_tile("state", [this]() { return new StateTile(this); });
   add_tile("switch", [this]() { return new SwitchTile(this); });
+  add_card("history", [this]() { return new HistoryCard(this); }, true);
 }
 
 }  // namespace esphome::bold_tiles
